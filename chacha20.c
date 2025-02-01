@@ -16,13 +16,6 @@ static uint32_t pack4(const uint8_t *a)
 	return res;
 }
 
-static void unpack4(uint32_t src, uint8_t *dst) {
-	dst[0] = (src >> 0 * 8) & 0xff;
-	dst[1] = (src >> 1 * 8) & 0xff;
-	dst[2] = (src >> 2 * 8) & 0xff;
-	dst[3] = (src >> 3 * 8) & 0xff;
-}
-
 static void chacha20_init_block(struct chacha20_context *ctx, uint8_t key[], uint8_t nonce[])
 {
 	memcpy(ctx->key, key, sizeof(ctx->key));
