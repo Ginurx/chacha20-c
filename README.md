@@ -121,6 +121,10 @@ both variants. It covers published known-answer vectors, streaming/chunk boundar
 counter exhaustion and atomic failure, invalid inputs, and the historical
 counter/nonce collision regression. Run commands from the repository root.
 
+GitHub Actions also cross-compiles and runs both variants for big-endian s390x
+under QEMU. Published known-answer vectors, rather than round trips alone, are
+the regression check for host-independent byte ordering.
+
 ### GCC
 
 Debug:

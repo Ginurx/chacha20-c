@@ -107,6 +107,7 @@ static void generate_block(struct chacha20_context *ctx)
 		quarter_round(working, 3, 4, 9, 14);
 	}
 
+	/* ChaCha20 output is little-endian; casts or memcpy use host byte order. */
 	for (i = 0; i < 16u; ++i)
 	{
 		working[i] += ctx->_chacha20_state[i];

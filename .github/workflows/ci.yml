@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  big-endian-s390x:
+    name: Big-endian s390x
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install s390x toolchain and emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            gcc-s390x-linux-gnu \
+            libc6-dev-s390x-cross \
+            qemu-user
+
+      - name: Verify big-endian target
+        run: |
+          byte_order="$({ s390x-linux-gnu-gcc -dM -E - < /dev/null; } \
+            | awk '$2 == "__BYTE_ORDER__" { print $3 }')"
+          if [ "$byte_order" != "__ORDER_BIG_ENDIAN__" ]; then
+            echo "Unexpected s390x byte order: $byte_order" >&2
+            exit 1
+          fi
+          echo "Verified s390x target byte order: big-endian ($byte_order)"
+
+      - name: Build both ChaCha20 variants
+        run: |
+          common_flags=(-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -I.)
+          s390x-linux-gnu-gcc "${common_flags[@]}" \
+            chacha20.c tests/test_chacha20.c \
+            -o "$RUNNER_TEMP/test-rfc8439-s390x"
+          s390x-linux-gnu-gcc "${common_flags[@]}" \
+            -DCHACHA20_VARIANT=CHACHA20_VARIANT_ORIGINAL \
+            chacha20.c tests/test_chacha20.c \
+            -o "$RUNNER_TEMP/test-original-s390x"
+
+      - name: Run RFC 8439 tests on s390x
+        run: >-
+          qemu-s390x -L /usr/s390x-linux-gnu
+          "$RUNNER_TEMP/test-rfc8439-s390x"
+
+      - name: Run Original ChaCha20 tests on s390x
+        run: >-
+          qemu-s390x -L /usr/s390x-linux-gnu
+          "$RUNNER_TEMP/test-original-s390x"
