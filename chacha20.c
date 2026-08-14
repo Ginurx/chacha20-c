@@ -1,117 +1,252 @@
 #include "chacha20.h"
 
+#include <string.h>
 
-static uint32_t rotl32(uint32_t x, int n) 
+#if CHACHA20_VARIANT == CHACHA20_VARIANT_RFC8439
+#define CHACHA20_CONTEXT_MAGIC UINT32_C(0x84390001)
+#else
+#define CHACHA20_CONTEXT_MAGIC UINT32_C(0x4f524947)
+#endif
+
+static uint32_t rotl32(uint32_t value, unsigned int count)
 {
-	return (x << n) | (x >> (32 - n));
+	return (value << count) | (value >> (32u - count));
 }
 
-static uint32_t pack4(const uint8_t *a)
+static uint32_t load32_le(const uint8_t bytes[4])
 {
-	uint32_t res = 0;
-	res |= (uint32_t)a[0] << 0 * 8;
-	res |= (uint32_t)a[1] << 1 * 8;
-	res |= (uint32_t)a[2] << 2 * 8;
-	res |= (uint32_t)a[3] << 3 * 8;
-	return res;
+	return ((uint32_t)bytes[0]) |
+	       ((uint32_t)bytes[1] << 8) |
+	       ((uint32_t)bytes[2] << 16) |
+	       ((uint32_t)bytes[3] << 24);
 }
 
-static void chacha20_init_block(struct chacha20_context *ctx, uint8_t key[], uint8_t nonce[])
+static void store32_le(uint8_t bytes[4], uint32_t value)
 {
-	memcpy(ctx->key, key, sizeof(ctx->key));
-	memcpy(ctx->nonce, nonce, sizeof(ctx->nonce));
-
-	const uint8_t *magic_constant = (uint8_t*)"expand 32-byte k";
-	ctx->state[0] = pack4(magic_constant + 0 * 4);
-	ctx->state[1] = pack4(magic_constant + 1 * 4);
-	ctx->state[2] = pack4(magic_constant + 2 * 4);
-	ctx->state[3] = pack4(magic_constant + 3 * 4);
-	ctx->state[4] = pack4(key + 0 * 4);
-	ctx->state[5] = pack4(key + 1 * 4);
-	ctx->state[6] = pack4(key + 2 * 4);
-	ctx->state[7] = pack4(key + 3 * 4);
-	ctx->state[8] = pack4(key + 4 * 4);
-	ctx->state[9] = pack4(key + 5 * 4);
-	ctx->state[10] = pack4(key + 6 * 4);
-	ctx->state[11] = pack4(key + 7 * 4);
-	// 64 bit counter initialized to zero by default.
-	ctx->state[12] = 0;
-	ctx->state[13] = pack4(nonce + 0 * 4);
-	ctx->state[14] = pack4(nonce + 1 * 4);
-	ctx->state[15] = pack4(nonce + 2 * 4);
-
-	memcpy(ctx->nonce, nonce, sizeof(ctx->nonce));
+	bytes[0] = (uint8_t)value;
+	bytes[1] = (uint8_t)(value >> 8);
+	bytes[2] = (uint8_t)(value >> 16);
+	bytes[3] = (uint8_t)(value >> 24);
 }
 
-static void chacha20_block_set_counter(struct chacha20_context *ctx, uint64_t counter)
+static void quarter_round(
+	uint32_t words[16], unsigned int a, unsigned int b,
+	unsigned int c, unsigned int d)
 {
-	ctx->state[12] = (uint32_t)counter;
-	ctx->state[13] = pack4(ctx->nonce + 0 * 4) + (uint32_t)(counter >> 32);
+	words[a] += words[b];
+	words[d] = rotl32(words[d] ^ words[a], 16);
+	words[c] += words[d];
+	words[b] = rotl32(words[b] ^ words[c], 12);
+	words[a] += words[b];
+	words[d] = rotl32(words[d] ^ words[a], 8);
+	words[c] += words[d];
+	words[b] = rotl32(words[b] ^ words[c], 7);
 }
 
-static void chacha20_block_next(struct chacha20_context *ctx) {
-	// This is where the crazy voodoo magic happens.
-	// Mix the bytes a lot and hope that nobody finds out how to undo it.
-	for (int i = 0; i < 16; i++) ctx->keystream32[i] = ctx->state[i];
+static uint64_t current_counter(const struct chacha20_context *ctx)
+{
+#if CHACHA20_VARIANT == CHACHA20_VARIANT_RFC8439
+	return ctx->_chacha20_state[12];
+#else
+	return ((uint64_t)ctx->_chacha20_state[13] << 32) |
+	       ctx->_chacha20_state[12];
+#endif
+}
 
-#define CHACHA20_QUARTERROUND(x, a, b, c, d) \
-    x[a] += x[b]; x[d] = rotl32(x[d] ^ x[a], 16); \
-    x[c] += x[d]; x[b] = rotl32(x[b] ^ x[c], 12); \
-    x[a] += x[b]; x[d] = rotl32(x[d] ^ x[a], 8); \
-    x[c] += x[d]; x[b] = rotl32(x[b] ^ x[c], 7);
-
-	for (int i = 0; i < 10; i++) 
+static int context_is_valid(const struct chacha20_context *ctx)
+{
+	if (ctx->_chacha20_magic != CHACHA20_CONTEXT_MAGIC ||
+	    ctx->_chacha20_position > CHACHA20_BLOCK_SIZE ||
+	    ctx->_chacha20_exhausted > 1u)
 	{
-		CHACHA20_QUARTERROUND(ctx->keystream32, 0, 4, 8, 12)
-		CHACHA20_QUARTERROUND(ctx->keystream32, 1, 5, 9, 13)
-		CHACHA20_QUARTERROUND(ctx->keystream32, 2, 6, 10, 14)
-		CHACHA20_QUARTERROUND(ctx->keystream32, 3, 7, 11, 15)
-		CHACHA20_QUARTERROUND(ctx->keystream32, 0, 5, 10, 15)
-		CHACHA20_QUARTERROUND(ctx->keystream32, 1, 6, 11, 12)
-		CHACHA20_QUARTERROUND(ctx->keystream32, 2, 7, 8, 13)
-		CHACHA20_QUARTERROUND(ctx->keystream32, 3, 4, 9, 14)
+		return 0;
 	}
 
-	for (int i = 0; i < 16; i++) ctx->keystream32[i] += ctx->state[i];
-
-	uint32_t *counter = ctx->state + 12;
-	// increment counter
-	counter[0]++;
-	if (0 == counter[0]) 
+	if (ctx->_chacha20_exhausted != 0u &&
+	    current_counter(ctx) != CHACHA20_COUNTER_MAX)
 	{
-		// wrap around occured, increment higher 32 bits of counter
-		counter[1]++;
-		// Limited to 2^64 blocks of 64 bytes each.
-		// If you want to process more than 1180591620717411303424 bytes
-		// you have other problems.
-		// We could keep counting with counter[2] and counter[3] (nonce),
-		// but then we risk reusing the nonce which is very bad.
-		assert(0 != counter[1]);
+		return 0;
 	}
+
+	return 1;
 }
 
-void chacha20_init_context(struct chacha20_context *ctx, uint8_t key[], uint8_t nonce[], uint64_t counter)
+static void advance_counter(struct chacha20_context *ctx)
 {
-	memset(ctx, 0, sizeof(struct chacha20_context));
-
-	chacha20_init_block(ctx, key, nonce);
-	chacha20_block_set_counter(ctx, counter);
-
-	ctx->counter = counter;
-	ctx->position = 64;
-}
-
-void chacha20_xor(struct chacha20_context *ctx, uint8_t *bytes, size_t n_bytes)
-{
-	uint8_t *keystream8 = (uint8_t*)ctx->keystream32;
-	for (size_t i = 0; i < n_bytes; i++) 
+	if (current_counter(ctx) == CHACHA20_COUNTER_MAX)
 	{
-		if (ctx->position >= 64) 
+		ctx->_chacha20_exhausted = 1u;
+		return;
+	}
+
+	ctx->_chacha20_state[12]++;
+#if CHACHA20_VARIANT == CHACHA20_VARIANT_ORIGINAL
+	if (ctx->_chacha20_state[12] == 0u)
+	{
+		ctx->_chacha20_state[13]++;
+	}
+#endif
+}
+
+static void generate_block(struct chacha20_context *ctx)
+{
+	uint32_t working[16];
+	unsigned int i;
+
+	memcpy(working, ctx->_chacha20_state, sizeof(working));
+
+	for (i = 0; i < 10u; ++i)
+	{
+		quarter_round(working, 0, 4, 8, 12);
+		quarter_round(working, 1, 5, 9, 13);
+		quarter_round(working, 2, 6, 10, 14);
+		quarter_round(working, 3, 7, 11, 15);
+		quarter_round(working, 0, 5, 10, 15);
+		quarter_round(working, 1, 6, 11, 12);
+		quarter_round(working, 2, 7, 8, 13);
+		quarter_round(working, 3, 4, 9, 14);
+	}
+
+	for (i = 0; i < 16u; ++i)
+	{
+		working[i] += ctx->_chacha20_state[i];
+		store32_le(ctx->_chacha20_keystream + (i * 4u), working[i]);
+	}
+
+	advance_counter(ctx);
+	ctx->_chacha20_position = 0u;
+}
+
+enum chacha20_status chacha20_init_context(
+	struct chacha20_context *ctx,
+	const uint8_t key[CHACHA20_KEY_SIZE],
+	const uint8_t nonce[CHACHA20_NONCE_SIZE],
+	uint64_t counter)
+{
+	static const uint8_t constants[] = "expand 32-byte k";
+	unsigned int i;
+
+	if (ctx == NULL)
+	{
+		return CHACHA20_ERR_INVALID_ARGUMENT;
+	}
+
+	/* Every failed initialization leaves a deterministically invalid context. */
+	memset(ctx, 0, sizeof(*ctx));
+
+	if (key == NULL || nonce == NULL)
+	{
+		return CHACHA20_ERR_INVALID_ARGUMENT;
+	}
+
+#if CHACHA20_VARIANT == CHACHA20_VARIANT_RFC8439
+	if (counter > CHACHA20_COUNTER_MAX)
+	{
+		return CHACHA20_ERR_COUNTER_RANGE;
+	}
+#endif
+
+	for (i = 0; i < 4u; ++i)
+	{
+		ctx->_chacha20_state[i] = load32_le(constants + (i * 4u));
+	}
+	for (i = 0; i < 8u; ++i)
+	{
+		ctx->_chacha20_state[4u + i] = load32_le(key + (i * 4u));
+	}
+
+	ctx->_chacha20_state[12] = (uint32_t)counter;
+#if CHACHA20_VARIANT == CHACHA20_VARIANT_RFC8439
+	ctx->_chacha20_state[13] = load32_le(nonce);
+	ctx->_chacha20_state[14] = load32_le(nonce + 4u);
+	ctx->_chacha20_state[15] = load32_le(nonce + 8u);
+#else
+	ctx->_chacha20_state[13] = (uint32_t)(counter >> 32);
+	ctx->_chacha20_state[14] = load32_le(nonce);
+	ctx->_chacha20_state[15] = load32_le(nonce + 4u);
+#endif
+
+	ctx->_chacha20_position = CHACHA20_BLOCK_SIZE;
+	ctx->_chacha20_magic = CHACHA20_CONTEXT_MAGIC;
+	return CHACHA20_OK;
+}
+
+enum chacha20_status chacha20_xor(
+	struct chacha20_context *ctx,
+	uint8_t *bytes,
+	size_t n_bytes)
+{
+	size_t cached_bytes;
+	size_t bytes_requiring_blocks;
+	size_t blocks_needed;
+	size_t offset = 0u;
+
+	if (ctx == NULL)
+	{
+		return CHACHA20_ERR_INVALID_ARGUMENT;
+	}
+	if (!context_is_valid(ctx))
+	{
+		return CHACHA20_ERR_INVALID_STATE;
+	}
+	if (n_bytes == 0u)
+	{
+		return CHACHA20_OK;
+	}
+	if (bytes == NULL)
+	{
+		return CHACHA20_ERR_INVALID_ARGUMENT;
+	}
+
+	cached_bytes = CHACHA20_BLOCK_SIZE - ctx->_chacha20_position;
+	bytes_requiring_blocks = n_bytes > cached_bytes
+		? n_bytes - cached_bytes
+		: 0u;
+	blocks_needed = bytes_requiring_blocks / CHACHA20_BLOCK_SIZE;
+	if ((bytes_requiring_blocks % CHACHA20_BLOCK_SIZE) != 0u)
+	{
+		blocks_needed++;
+	}
+
+	/* Preflight the complete request before changing the context or output. */
+	if (blocks_needed != 0u)
+	{
+		uint64_t counter = current_counter(ctx);
+
+		if (ctx->_chacha20_exhausted != 0u ||
+		    blocks_needed - 1u > CHACHA20_COUNTER_MAX - counter)
 		{
-			chacha20_block_next(ctx);
-			ctx->position = 0;
+			return CHACHA20_ERR_COUNTER_EXHAUSTED;
 		}
-		bytes[i] ^= keystream8[ctx->position];
-		ctx->position++;
 	}
+
+	while (offset < n_bytes)
+	{
+		size_t available;
+		size_t chunk;
+		size_t i;
+
+		if (ctx->_chacha20_position == CHACHA20_BLOCK_SIZE)
+		{
+			generate_block(ctx);
+		}
+
+		available = CHACHA20_BLOCK_SIZE - ctx->_chacha20_position;
+		chunk = n_bytes - offset;
+		if (chunk > available)
+		{
+			chunk = available;
+		}
+
+		for (i = 0; i < chunk; ++i)
+		{
+			bytes[offset + i] ^=
+				ctx->_chacha20_keystream[ctx->_chacha20_position + i];
+		}
+
+		ctx->_chacha20_position += chunk;
+		offset += chunk;
+	}
+
+	return CHACHA20_OK;
 }
